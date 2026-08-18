@@ -69,10 +69,12 @@ ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]
 spring:
   datasource:
     hikari:
-      maximum-pool-size: 10
+      maximum-pool-size: 15
       minimum-idle: 5
       connection-timeout: 30000   # 커넥션 대기 30초 초과 시 예외
 ```
+
+- **10 → 15로 올린 이유(실제 사례):** `ReportAnalysisStatusQueryService.resolveAll`이 `REQUIRES_NEW`로 별도 트랜잭션을 쓴다 — 호출자(목록/상세 조회)의 트랜잭션 안에서 예외를 잡으면 Hibernate가 세션을 rollback-only로 표시해 커밋 시 `UnexpectedRollbackException`이 다시 터지기 때문에(degrade 로직이 성립하려면 REQUIRES_NEW가 필수) 격리를 택했다. 그런데 Spring이 `REQUIRES_NEW` 진입 시 바깥 트랜잭션의 커넥션을 반납하지 않고 그대로 쥔 채 새 커넥션을 하나 더 받으므로, **요청 하나가 순간적으로 커넥션 2개를 점유**한다. 동시 요청이 몰리면 실효 동시성이 절반으로 줄어 10에서는 `connection-timeout`이 날 수 있어 여유를 뒀다(design.md `feat/ocr-failure-status` §14 I4). **같은 함정을 피하려면:** `REQUIRES_NEW`를 캐치-앤-디그레이드 용도로 쓸 때마다 풀 크기를 이 배율만큼 다시 계산할 것 — 무조건 늘리기보다, 가능하면 그 조회를 호출자의 트랜잭션 밖(비-트랜잭션 컨텍스트)에서 실행해 애초에 이중 점유를 피하는 구조도 함께 검토한다(이번엔 `open-in-view: false`상 DTO 조립이 트랜잭션 안에서 끝나야 해서 구조 변경 대신 풀 크기 증설을 택했다).
 
 **하드닝 TODO(아직 미적용 — 권장 추가값):**
 ```yaml

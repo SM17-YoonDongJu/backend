@@ -93,6 +93,19 @@ public class ReportReview extends BaseEntity {
     this.status = ReviewStatus.REJECTED;
   }
 
+  /**
+   * 고객이 이 제안으로 상담을 시작한다(채팅방 개설 트리거). SENT → COUNSELING.
+   * 이미 COUNSELING이면 멱등 no-op이다 — 더블클릭·재요청에서 같은 방을 그대로 쓰기 위함.
+   * 종료 상태(ACCEPTED/REJECTED)에서는 409 INVALID_STATE_TRANSITION.
+   */
+  public void startCounseling() {
+    if (this.status == ReviewStatus.COUNSELING) {
+      return;
+    }
+    ensureDecidable();
+    this.status = ReviewStatus.COUNSELING;
+  }
+
   /** 아직 결정 전(SENT·COUNSELING)이라 채택/거절 가능한지 — 종료 상태(ACCEPTED/REJECTED)면 false. */
   public boolean isDecidable() {
     return this.status != ReviewStatus.ACCEPTED && this.status != ReviewStatus.REJECTED;

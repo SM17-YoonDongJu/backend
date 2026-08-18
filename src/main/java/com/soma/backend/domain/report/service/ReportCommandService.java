@@ -7,21 +7,25 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.UUID;
 
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import lombok.RequiredArgsConstructor;
 
+import com.soma.backend.domain.chat.dto.ConsultationRoomResult;
+import com.soma.backend.domain.chat.service.ChatRoomCommandService;
 import com.soma.backend.domain.report.dto.CreateReportRequest;
 import com.soma.backend.domain.report.dto.CreateReportResponse;
 import com.soma.backend.domain.report.dto.ProposalDecisionResponse;
 import com.soma.backend.domain.report.entity.Report;
 import com.soma.backend.domain.report.entity.ReportAttachment;
 import com.soma.backend.domain.report.entity.ReportReview;
-import com.soma.backend.domain.report.entity.ReviewStatus;
+import com.soma.backend.domain.report.entity.ReportStatus;
 import com.soma.backend.domain.report.entity.UserClaim;
 import com.soma.backend.domain.report.entity.claim.ClaimDetails;
+import com.soma.backend.domain.report.entity.event.ConsultationRequestedEvent;
 import com.soma.backend.domain.report.repository.ReportAttachmentRepository;
 import com.soma.backend.domain.report.repository.ReportRepository;
 import com.soma.backend.domain.report.repository.ReportReviewRepository;
@@ -48,6 +52,8 @@ public class ReportCommandService {
   private final ReportAttachmentRepository reportAttachmentRepository;
   private final ReportReviewRepository reportReviewRepository;
   private final OcrJobOutboxPort ocrJobOutboxPort;
+  private final ChatRoomCommandService chatRoomCommandService;
+  private final ApplicationEventPublisher eventPublisher;
 
   /** POST /reports — 사고 정보 입력 수신 → 저장 → OCR 트리거 발행. 202(비동기). */
   public CreateReportResponse createReport(UUID userId, CreateReportRequest request) {
@@ -106,9 +112,19 @@ public class ReportCommandService {
     return CreateReportResponse.from(report);
   }
 
-  /** PATCH /reports/{reportId}/proposals/{proposalId} — 본인 리포트의 특정 제안 채택/거절. */
+  /**
+   * PATCH /reports/{reportId}/proposals/{proposalId} — 본인 리포트의 특정 제안 상담 수락(ACCEPTED).
+   *
+   * <p>이 엔드포인트는 "상담 수락 전용"이다. 최종 채택(제안 ACCEPTED·리포트 CLOSED)은 채팅방 화면의
+   * PATCH /chats/{chatRoomId}/accept에서만 하고, 거절은 PATCH /chats/{chatRoomId}/reject에서만 한다.
+   *
+   * <p><b>요청 status=ACCEPTED가 응답 review_status=COUNSELING을 만드는 이유</b>: 요청값 ACCEPTED는
+   * "제안을 ACCEPTED로 바꿔라"가 아니라 "이 사정사와 상담을 수락한다(=채팅방을 연다)"는 뜻이다. 그
+   * 결과로 제안은 실제 도메인 전이인 SENT→COUNSELING을 밟으므로 응답에는 COUNSELING이 담긴다.
+   * 요청 문자열과 응답 상태값이 다른 건 의도된 계약이다(프론트 화면 흐름에 맞춘 명명).
+   */
   public ProposalDecisionResponse decide(UUID userId, UUID reportId, UUID proposalId, String status) {
-    ReviewStatus decision = parseDecision(status);
+    boolean startsCounseling = parseDecision(status);
 
     Report report = reportRepository.findById(reportId)
         .orElseThrow(() -> new BusinessException(ErrorCode.REPORT_NOT_FOUND));
@@ -122,32 +138,49 @@ public class ReportCommandService {
       throw new BusinessException(ErrorCode.PROPOSAL_NOT_FOUND);
     }
 
-    if (decision == ReviewStatus.ACCEPTED) {
-      review.accept();
-      report.accept(review.getAdjusterId());
-    } else {
-      review.reject();
-    }
+    UUID chatRoomId = startsCounseling ? startCounseling(report, review) : null;
 
     return new ProposalDecisionResponse(
-        reportId, review.getId(), review.getAdjusterId(), report.getStatus(), review.getStatus());
+        reportId, review.getId(), review.getAdjusterId(), report.getStatus(), review.getStatus(), chatRoomId);
   }
 
-  /** ACCEPTED/REJECTED만 허용 — 그 외 값은 400. */
-  private ReviewStatus parseDecision(String status) {
+  /**
+   * 상담 시작(제안 "상담 수락"): 제안 SENT→COUNSELING, 리포트 →COUNSELING 전이를 먼저 끝내고 그 다음
+   * chat 도메인에 방 개설을 위임한다. 순서가 중요하다 — 던질 수 있는 검증(제안 종료 상태·리포트 전이표
+   * 위반)을 방 INSERT 앞에 모아 고아 방이 생기지 않게 한다(ReportReviewCommandService의 스켈레톤 순서와
+   * 같은 사고방식). 방이 새로 열렸을 때만 사정사에게 상담 요청 알림을 발행한다(재요청 스팸 방지).
+   */
+  private UUID startCounseling(Report report, ReportReview review) {
+    review.startCounseling();
+    report.applyReviewTransition(ReportStatus.COUNSELING);
+
+    ConsultationRoomResult room = chatRoomCommandService.openConsultationRoom(
+        report.getUserId(), review.getAdjusterId(), report.getId(), review.getId());
+
+    if (room.created()) {
+      eventPublisher.publishEvent(new ConsultationRequestedEvent(
+          review.getAdjusterId(), report.getUserId(), report.getId(), review.getId(), room.chatRoomId()));
+    }
+    return room.chatRoomId();
+  }
+
+  /**
+   * ACCEPTED(상담 수락 — 채팅방 개설) 또는 REJECTED(현재 아무 동작 없음, 거절은
+   * PATCH /chats/{chatRoomId}/reject 전용)만 허용한다. 반환값은 상담 수락 여부(true=ACCEPTED)다.
+   * ReviewStatus enum을 재사용하지 않는 이유: 이 요청값은 더 이상 REPORT_REVIEWS.status와
+   * 1:1 대응하지 않는다(ACCEPTED 요청 → 실제로는 review가 COUNSELING이 된다).
+   */
+  private boolean parseDecision(String status) {
     if (!StringUtils.hasText(status)) {
       throw new BusinessException(ErrorCode.MISSING_REQUIRED_FIELD);
     }
-    ReviewStatus decision;
-    try {
-      decision = ReviewStatus.valueOf(status);
-    } catch (IllegalArgumentException ex) {
-      throw new BusinessException(ErrorCode.VALIDATION_ERROR);
+    if ("ACCEPTED".equals(status)) {
+      return true;
     }
-    if (decision != ReviewStatus.ACCEPTED && decision != ReviewStatus.REJECTED) {
-      throw new BusinessException(ErrorCode.VALIDATION_ERROR);
+    if ("REJECTED".equals(status)) {
+      return false;
     }
-    return decision;
+    throw new BusinessException(ErrorCode.VALIDATION_ERROR);
   }
 
   /** 사람용 사건번호 yyyyMMdd-NNN. 당일 시퀀스는 DB 원자 카운터로 발급해 동시 생성 경합을 차단한다. */

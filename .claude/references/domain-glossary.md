@@ -57,14 +57,6 @@ BLOCKED              ← AI 입력 가드레일 차단(보험·법률 외 주제
                        reports.status를 원시 SQL로 직접 'BLOCKED'로 세팅한다(Backend 도메인 메서드를
                        거치지 않음). **종료 상태**이며 `Report.ALLOWED_TRANSITIONS`엔 자기 자신으로만
                        존재해 어떤 리뷰/채택 흐름으로도 나가거나 들어올 수 없다.
-
-NEEDS_REUPLOAD       ← OCR 품질 미달(신뢰도 낮음 + 이름/도메인 정보 미검출, 예: 흐릿한 사진). BLOCKED와
-                       같은 구조의 별도 진입점 — AI 워커가 리포트 생성을 건너뛰고 reports.status를
-                       원시 SQL로 직접 'NEEDS_REUPLOAD'로 세팅한다. "실패"가 아니라 "품질 판정"이라
-                       ai.ocr_job_failures에 저널 행이 남지 않는다. **종료 상태**(자기 자신으로만),
-                       회복 경로는 재업로드(새 리포트 생성)뿐 — 기존 리포트를 되살리는 API는 없다.
-```
-
 > 상태 전이 허용표(`Report.applyReviewTransition`): AWAITING_INSPECTION→{AWAITING_ADOPTION, NOT_SELECTED}, AWAITING_ADOPTION→{COUNSELING, NOT_SELECTED}, COUNSELING→{CLOSED, AWAITING_ADOPTION}, NOT_SELECTED→{COUNSELING}, CLOSED→(종료), BLOCKED→(종료, AI 워커가 직접 세팅), NEEDS_REUPLOAD→(종료, AI 워커가 직접 세팅).
 
 ### 상태별 사용자 표시 문자열 (API 응답 `status` 필드)
@@ -78,8 +70,6 @@ NEEDS_REUPLOAD       ← OCR 품질 미달(신뢰도 낮음 + 이름/도메인 �
 | `CLOSED` | `완료` | — | ✅ | ❌ |
 | `NOT_SELECTED` | (표시 문자열 코드 미확정) | ❌ (신규 검수 차단) | ✅ | 재개 시 COUNSELING 가능 |
 | `BLOCKED` | `BLOCKED`(그대로 노출, 별도 매핑 없음) | ❌ (검수 대상 자체가 아님) | ✅ | ❌ |
-| `NEEDS_REUPLOAD` | `NEEDS_REUPLOAD`(그대로 노출, 별도 매핑 없음) | ❌ (AI 초안이 영영 생성되지 않음) | ✅ | ❌ |
-
 > 리포트 `status` 필터·응답 값 표기: `생성 중` / `채택 대기중` / `상담 중` / `완료`. `NOT_SELECTED`(미채택)·`BLOCKED`(가드레일 차단)·`NEEDS_REUPLOAD`(OCR 품질 미달)의 사용자 표시 문자열은 `ReportResponseSupport.customerStatus()`가 `CLOSED`만 `"MATCHED"`로 바꾸고 나머지는 enum 이름을 그대로 내리는 방식이라, 셋 다 코드값 그대로 노출된다(전용 한글 문구는 코드에 아직 정의되지 않음).
 
 ### 3-1. 분석 처리 상태 (AnalysisState — REPORTS.status와 별도 축)

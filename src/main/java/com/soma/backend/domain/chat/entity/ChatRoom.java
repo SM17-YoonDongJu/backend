@@ -114,4 +114,23 @@ public class ChatRoom extends BaseEntity {
   public void close() {
     this.status = ChatRoomStatus.CLOSED;
   }
+
+  /**
+   * 상담 채팅방을 개설한다(고객이 제안을 골라 상담을 시작하는 시점). 파이프라인 방이므로
+   * reportId·reportReviewId가 모두 필수다 — 하나라도 비면 {@link #canDecideConsultation()}이 거짓이 되어
+   * 이후 상담 수락/거절이 영구히 막힌다. 방 생명주기는 ACTIVE로 시작하며, 수락/거절 결정 상태는
+   * 여기서 다루지 않는다(REPORT_REVIEWS.status가 소유).
+   */
+  public static ChatRoom openConsultation(UUID userId, UUID adjusterId, UUID reportId, UUID reportReviewId) {
+    if (userId == null || adjusterId == null || reportId == null || reportReviewId == null) {
+      throw new BusinessException(ErrorCode.MISSING_REQUIRED_FIELD);
+    }
+    ChatRoom room = new ChatRoom();
+    room.userId = userId;
+    room.adjusterId = adjusterId;
+    room.reportId = reportId;
+    room.reportReviewId = reportReviewId;
+    room.status = ChatRoomStatus.ACTIVE;
+    return room;
+  }
 }

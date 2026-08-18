@@ -9,8 +9,9 @@ import com.soma.backend.domain.chat.entity.ChatRoom;
 import com.soma.backend.domain.chat.entity.ChatRoomStatus;
 
 /**
- * {@link ChatRoom}은 방 생성(D1, 다른 팀 담당)이 아직 chat 도메인에 없어 public 팩터리·setter가 없다.
- * 테스트 픽스처는 protected 기본 생성자를 리플렉션으로 인스턴스화하고 필드를 직접 채운다.
+ * {@link ChatRoom}에는 상담 방 개설 팩터리({@code openConsultation})가 있지만, 테스트 픽스처는 CLOSED 방·
+ * 검색 방(reportId·reportReviewId 없음)처럼 팩터리가 허용하지 않는 임의 상태도 만들어야 한다.
+ * 그래서 protected 기본 생성자를 리플렉션으로 인스턴스화하고 필드를 직접 채운다.
  *
  * <p>단위 테스트(Mockito)는 {@link #assignId}로 id를 직접 부여해 응답 DTO 조립에 쓰고,
  * 통합 테스트(@SpringBootTest 실제 test_db)는 id를 비워둔 채 저장해 {@code @GeneratedValue}가

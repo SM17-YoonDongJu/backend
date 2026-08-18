@@ -36,7 +36,7 @@ Spring Boot 백엔드 피처 구현을 위해 전문 에이전트 팀을 조율�
 
 ### Phase 0: 컨텍스트 확인
 
-1. `_workspace/` 존재 여부 확인
+1. `_workspace/` 존재 여부 확인 — **레포 루트 기준**이다(`.claude/settings.json`의 `Write(_workspace/**)` 권한도 루트 기준 glob). 이 스킬 파일이 있는 `.claude/skills/springboot-dev/` 밑이 아니다 — 과거 세션이 이 경로를 스킬 디렉터리 기준으로 오해해 `.claude/skills/springboot-dev/_workspace/`에 산출물을 남긴 전례가 있다(정리하지 않고 보존 중 — harness.md §8 "삭제하지 않는다" 원칙).
 2. 실행 모드 결정:
    - **미존재** → 초기 실행. Phase 1로 진행
    - **존재 + 부분 수정 요청** → 해당 에이전트만 재호출, 기존 산출물 중 수정 대상만 덮어쓰기

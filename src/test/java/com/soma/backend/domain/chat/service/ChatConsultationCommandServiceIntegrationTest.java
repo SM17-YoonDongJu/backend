@@ -81,6 +81,13 @@ class ChatConsultationCommandServiceIntegrationTest {
     return reportRepository.save(report);
   }
 
+  /** 상담이 진행 중인(COUNSELING) 제안 — 채팅 화면에서 수락/거절을 누를 수 있는 실제 상태다. */
+  private ReportReview counselingReview(UUID reportId, UUID adjusterId) {
+    ReportReview review = reportReviewRepository.save(new ReportReview(reportId, adjusterId));
+    review.startCounseling();
+    return review;
+  }
+
   private ChatRoom savedRoom(UUID userId, UUID adjusterId, UUID reportId, UUID reportReviewId) {
     ChatRoom room = ChatRoomFixture.build(userId, adjusterId, reportId, reportReviewId, ChatRoomStatus.ACTIVE);
     return chatRoomRepository.save(room);
@@ -149,6 +156,134 @@ class ChatConsultationCommandServiceIntegrationTest {
     assertThat(reloadedOther.getStatus()).isEqualTo(ReviewStatus.SENT);
     assertThat(reloadedReport.getStatus()).isEqualTo(ReportStatus.AWAITING_ADOPTION);
     assertThat(reloadedRoom.getStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+  }
+
+  /**
+   * 같은 리포트로 상담을 2건 동시에 진행하다 하나를 거절하는 상황. 살아있는 상담이 있는데 리포트를 채택
+   * 대기로 되돌리면 {@code ReportNotSelectionSweeper}가 접수 7일 뒤 그 리포트를 NOT_SELECTED로 잘못
+   * 전이시킬 수 있다 — 리포트는 COUNSELING을 유지해야 한다.
+   */
+  @Test
+  @DisplayName("형제 제안이 아직 COUNSELING이면 리포트는 COUNSELING을 유지하고 내 제안·내 방만 정리된다")
+  void reject_keepsReportCounseling_whenSiblingStillCounseling() {
+    Report report = counselingReport();
+    ReportReview myReview = counselingReview(report.getId(), adjuster1.getId());
+    ReportReview siblingReview = counselingReview(report.getId(), adjuster2.getId());
+    ChatRoom myRoom = savedRoom(customer.getId(), adjuster1.getId(), report.getId(), myReview.getId());
+    ChatRoom siblingRoom =
+        savedRoom(customer.getId(), adjuster2.getId(), report.getId(), siblingReview.getId());
+
+    ConsultationDecisionResponse response = chatConsultationCommandService.reject(customer.getId(), myRoom.getId());
+
+    assertThat(response.reportStatus()).isEqualTo(ReportStatus.COUNSELING);
+    assertThat(response.reviewStatus()).isEqualTo(ReviewStatus.REJECTED);
+    assertThat(response.chatRoomStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+
+    assertThat(reportRepository.findById(report.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReportStatus.COUNSELING);
+    assertThat(reportReviewRepository.findById(myReview.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReviewStatus.REJECTED);
+    assertThat(reportReviewRepository.findById(siblingReview.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReviewStatus.COUNSELING);
+    assertThat(chatRoomRepository.findById(myRoom.getId()).orElseThrow().getStatus())
+        .isEqualTo(ChatRoomStatus.CLOSED);
+    assertThat(chatRoomRepository.findById(siblingRoom.getId()).orElseThrow().getStatus())
+        .isEqualTo(ChatRoomStatus.ACTIVE);
+    assertThat(chatMessageRepository.findByCursor(siblingRoom.getId(), null, null, 10)).isEmpty();
+  }
+
+  /** 형제 판정 기준은 "형제가 있는가"가 아니라 "형제가 COUNSELING인가"임을 실 DB 조회로 고정한다. */
+  @Test
+  @DisplayName("형제 제안이 SENT·ACCEPTED·REJECTED뿐이면 리포트는 정상적으로 채택 대기로 돌아온다")
+  void reject_reopensReport_whenNoSiblingIsCounseling() {
+    User adjuster3 = userRepository.save(
+        User.create("사정사3", LocalDate.of(1985, 1, 1), "M", null, null, Role.CERTIFICATED_ADJUSTER, null));
+    Report report = counselingReport();
+    ReportReview myReview = counselingReview(report.getId(), adjuster1.getId());
+    ReportReview sentSibling = reportReviewRepository.save(new ReportReview(report.getId(), adjuster2.getId()));
+    ReportReview rejectedSibling = reportReviewRepository.save(new ReportReview(report.getId(), adjuster3.getId()));
+    rejectedSibling.reject();
+    ChatRoom myRoom = savedRoom(customer.getId(), adjuster1.getId(), report.getId(), myReview.getId());
+
+    ConsultationDecisionResponse response = chatConsultationCommandService.reject(customer.getId(), myRoom.getId());
+
+    assertThat(response.reportStatus()).isEqualTo(ReportStatus.AWAITING_ADOPTION);
+    assertThat(reportRepository.findById(report.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReportStatus.AWAITING_ADOPTION);
+    assertThat(reportReviewRepository.findById(sentSibling.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReviewStatus.SENT);
+    assertThat(chatRoomRepository.findById(myRoom.getId()).orElseThrow().getStatus())
+        .isEqualTo(ChatRoomStatus.CLOSED);
+  }
+
+  /**
+   * {@code reopenForAdoption()}은 COUNSELING이 아닌 리포트에서 409를 던지므로, 가드가 없으면 거절 자체가
+   * 롤백된다. 리포트 경로 채택({@code PATCH /reports/.../proposals/...} status=ACCEPTED)이 형제 제안·형제 방을
+   * 캐스케이드로 정리하지 않아(design.md §9 #1) "리포트는 CLOSED인데 내 제안은 아직 COUNSELING"이 실제로 남는다.
+   */
+  @Test
+  @DisplayName("리포트가 이미 CLOSED여도 제안 거절·방 종료는 성립하고 리포트 전이만 건너뛴다(409 없음)")
+  void reject_skipsReportTransition_whenReportAlreadyClosed() {
+    Report report = counselingReport();
+    ReportReview myReview = counselingReview(report.getId(), adjuster1.getId());
+    ChatRoom myRoom = savedRoom(customer.getId(), adjuster1.getId(), report.getId(), myReview.getId());
+    report.accept(adjuster2.getId());
+
+    ConsultationDecisionResponse response = chatConsultationCommandService.reject(customer.getId(), myRoom.getId());
+
+    assertThat(response.reportStatus()).isEqualTo(ReportStatus.CLOSED);
+    assertThat(response.reviewStatus()).isEqualTo(ReviewStatus.REJECTED);
+    assertThat(response.chatRoomStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+
+    assertThat(reportRepository.findById(report.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReportStatus.CLOSED);
+    assertThat(reportReviewRepository.findById(myReview.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReviewStatus.REJECTED);
+    assertThat(chatRoomRepository.findById(myRoom.getId()).orElseThrow().getStatus())
+        .isEqualTo(ChatRoomStatus.CLOSED);
+    List<ChatMessage> messages = chatMessageRepository.findByCursor(myRoom.getId(), null, null, 10);
+    assertThat(messages).hasSize(1);
+    assertThat(messages.get(0).getMessageType()).isEqualTo(ChatMessageType.SYSTEM);
+  }
+
+  /**
+   * 형제 COUNSELING 가드가 열어준 시나리오를 끝까지 이어본다 — 상담 2건이 동시에 진행되다 A를 거절하고
+   * (리포트는 COUNSELING 유지) 이어서 B를 수락하면 리포트가 담당 사정사 B로 정상 종결돼야 한다.
+   * 거절 단계에서 리포트가 채택 대기로 새어 나가면 남은 상담이 스케줄러(NOT_SELECTED)와 경합한다.
+   */
+  @Test
+  @DisplayName("상담 2건 중 하나를 거절한 뒤 남은 상담을 수락하면 리포트가 CLOSED로 정상 종결된다")
+  void rejectThenAcceptSibling_closesReportWithRemainingAdjuster() {
+    Report report = counselingReport();
+    ReportReview reviewA = counselingReview(report.getId(), adjuster1.getId());
+    ReportReview reviewB = counselingReview(report.getId(), adjuster2.getId());
+    ChatRoom roomA = savedRoom(customer.getId(), adjuster1.getId(), report.getId(), reviewA.getId());
+    ChatRoom roomB = savedRoom(customer.getId(), adjuster2.getId(), report.getId(), reviewB.getId());
+
+    chatConsultationCommandService.reject(customer.getId(), roomA.getId());
+    ConsultationDecisionResponse accepted =
+        chatConsultationCommandService.accept(customer.getId(), roomB.getId());
+
+    assertThat(accepted.reportStatus()).isEqualTo(ReportStatus.CLOSED);
+    assertThat(accepted.reviewStatus()).isEqualTo(ReviewStatus.ACCEPTED);
+    assertThat(accepted.chatRoomStatus()).isEqualTo(ChatRoomStatus.ACTIVE);
+
+    Report reloadedReport = reportRepository.findById(report.getId()).orElseThrow();
+    assertThat(reloadedReport.getStatus()).isEqualTo(ReportStatus.CLOSED);
+    assertThat(reloadedReport.getAdjusterId()).isEqualTo(adjuster2.getId());
+    assertThat(reportReviewRepository.findById(reviewA.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReviewStatus.REJECTED);
+    assertThat(reportReviewRepository.findById(reviewB.getId()).orElseThrow().getStatus())
+        .isEqualTo(ReviewStatus.ACCEPTED);
+    assertThat(chatRoomRepository.findById(roomA.getId()).orElseThrow().getStatus())
+        .isEqualTo(ChatRoomStatus.CLOSED);
+    assertThat(chatRoomRepository.findById(roomB.getId()).orElseThrow().getStatus())
+        .isEqualTo(ChatRoomStatus.ACTIVE);
+    // roomA는 자신의 reject()에서 이미 종료 안내를 남겼다 — roomB의 accept()가 형제 방을 정리할 때
+    // 이미 CLOSED인 roomA를 건너뛰므로 종료 안내가 중복되지 않는다.
+    assertThat(chatMessageRepository.findByCursor(roomA.getId(), null, null, 10))
+        .extracting(ChatMessage::getContent)
+        .containsExactly("상담이 종료되었습니다.");
   }
 
   @Test

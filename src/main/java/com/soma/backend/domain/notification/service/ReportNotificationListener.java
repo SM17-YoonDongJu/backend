@@ -21,6 +21,7 @@ import com.soma.backend.domain.report.entity.OcrResultView;
 import com.soma.backend.domain.report.entity.ReportAnalysis;
 import com.soma.backend.domain.report.entity.ReportAttachment;
 import com.soma.backend.domain.report.entity.event.AnalysisFailedEvent;
+import com.soma.backend.domain.report.entity.event.ConsultationRequestedEvent;
 import com.soma.backend.domain.report.entity.event.ReportBlockedEvent;
 import com.soma.backend.domain.report.entity.event.ReportNeedsReuploadEvent;
 import com.soma.backend.domain.report.entity.event.ReviewProposalReceivedEvent;
@@ -53,6 +54,22 @@ public class ReportNotificationListener {
         "새로운 제안이 도착했어요",
         "손해사정사가 새로운 검수 제안을 보냈어요. 제안을 비교해보세요.",
         Map.of("type", NotificationType.RECEIVED_PROPOSAL.name(), "reportId", event.reportId().toString()));
+  }
+
+  /**
+   * 상담 요청(고객이 제안의 "상담 수락"을 눌러 채팅방이 열림) 통지 — 수신자는 제안을 보낸 사정사다.
+   * 이 리스너의 유일한 사정사 수신 알림이라 {@code dispatch}의 첫 인자가 고객이 아니라 사정사 계정 id다
+   * (notifications.user_id는 users FK라 계정 id면 역할과 무관하게 동작한다).
+   * 푸시 토글은 CHAT_MESSAGE와 공용인 consult_message에 매핑돼 있다(NotificationSetting.allows).
+   */
+  @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+  public void onConsultationRequested(ConsultationRequestedEvent event) {
+    dispatch(event.adjusterId(), NotificationType.CONSULT_REQUESTED,
+        "상담 요청이 도착했어요",
+        "고객이 회원님의 제안으로 상담을 시작했어요. 채팅에서 확인해보세요.",
+        Map.of("type", NotificationType.CONSULT_REQUESTED.name(),
+            "reportId", event.reportId().toString(),
+            "chatRoomId", event.chatRoomId().toString()));
   }
 
   /**

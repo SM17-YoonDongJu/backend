@@ -36,12 +36,13 @@ import com.soma.backend.domain.report.repository.UserClaimRepository;
  *
  * <p>PII 컬럼(user_claims.question/description/additional_information/details, reports.question)은
  * 반드시 엔티티 팩터리(JPA 저장) 경로로만 만든다 — {@code PiiCipher}/컨버터가 자동으로 암호화한다.
- * raw SQL은 (1) 암호화 대상이 아닌 컬럼이면서 (2) Spring에 정식 쓰기 경로가 없는 경우에만 쓴다 —
- * {@code chatroom}(방 생성 기능이 아직 chat 도메인에 없음, {@code ChatRoomFixture} 테스트 주석 참고),
- * {@code reports}의 AI 초안 컬럼(claimed_min_amount 등 — 운영에서는 report_worker가 SQL로 직접 쓴다),
- * {@code report_reviews.status=COUNSELING}(채팅방 생성 시점에만 전이하는데 그 생성 로직이 아직 없음),
- * 그리고 시딩 데이터를 과거 시점처럼 보이게 하는 created_at/updated_at 백데이트(둘 다 {@code updatable=false}
- * 이거나 JPA auditing이 저장 시점을 자동 기록해 엔티티 API로는 과거 값을 넣을 수 없다).
+ * raw SQL은 (1) 암호화 대상이 아닌 컬럼이면서 (2) Spring에 정식 쓰기 경로가 없거나 그 경로로는 원하는
+ * 시딩 상태를 만들 수 없는 경우에만 쓴다 — {@code chatroom}(팩터리는 있으나 백데이트·임의 status가 필요,
+ * {@code ChatRoomFixture} 테스트 주석 참고), {@code reports}의 AI 초안 컬럼(claimed_min_amount 등 —
+ * 운영에서는 report_worker가 SQL로 직접 쓴다), {@code report_reviews.status=COUNSELING}(정식 경로는 채팅방
+ * 개설을 동반하는데 시더는 그 조합을 분리해야 한다), 그리고 시딩 데이터를 과거 시점처럼 보이게 하는
+ * created_at/updated_at 백데이트(둘 다 {@code updatable=false}이거나 JPA auditing이 저장 시점을 자동
+ * 기록해 엔티티 API로는 과거 값을 넣을 수 없다).
  */
 @Component
 @Profile("!test")
@@ -616,17 +617,18 @@ public class DevMockDataSeedRunner implements ApplicationRunner {
   }
 
   /**
-   * REPORT_REVIEWS.status를 COUNSELING으로 강제 전이한다. 운영에서는 채팅방 생성 시점에만 이 상태로 바뀌는데
-   * (design.md, 채팅 도메인 별도 티켓) 그 생성 로직이 아직 이 코드베이스에 없어(ChatRoom 팩터리 부재와 동일한
-   * 이유) 엔티티에 공개 전이 메서드가 없다. status는 PII 암호화 대상이 아니다.
+   * REPORT_REVIEWS.status를 COUNSELING으로 강제 전이한다. 운영에서는 {@code ReportReview.startCounseling()}
+   * (상담 시작 API)이 채팅방 개설과 한 트랜잭션에서 이 상태로 바꾼다. 시더는 방 없이 COUNSELING 행만
+   * 만들거나 리포트 전이를 건너뛰는 조합이 필요해 raw SQL을 유지한다. status는 PII 암호화 대상이 아니다.
    */
   private void forceReviewCounseling(UUID reviewId) {
     jdbcTemplate.update("UPDATE report_reviews SET status = 'COUNSELING' WHERE id = ?", reviewId);
   }
 
   /**
-   * chatroom은 방 생성 기능이 아직 chat 도메인에 없어(test의 {@code ChatRoomFixture}와 동일한 사유) 엔티티
-   * 팩터리가 없다. 대상 컬럼 중 암호화된 것이 없어 raw INSERT로도 안전하다.
+   * chatroom 엔티티 팩터리({@code ChatRoom.openConsultation})는 있지만, 시더는 방을 과거 시점으로 백데이트하고
+   * CLOSED 등 임의 status로도 만들어야 해 raw INSERT를 유지한다(created_at은 JPA auditing이 저장 시점으로
+   * 덮어쓴다). 대상 컬럼 중 암호화된 것이 없어 raw INSERT로도 안전하다.
    */
   private UUID insertChatRoom(UUID userId, UUID adjusterId, UUID reportId, UUID reportReviewId, String status,
       LocalDateTime createdAt) {

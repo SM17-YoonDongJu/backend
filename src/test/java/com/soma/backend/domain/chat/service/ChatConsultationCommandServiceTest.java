@@ -171,6 +171,33 @@ class ChatConsultationCommandServiceTest {
     }
 
     @Test
+    @DisplayName("이미 CLOSED인 형제 방은 다시 닫거나 종료 안내를 중복으로 남기지 않는다")
+    void accept_skipsAlreadyClosedSiblingRoom() {
+      ChatRoom room = pipelineRoom(ChatRoomStatus.ACTIVE);
+      ReportReview myReview = reviewWithId(reviewId, reportId, adjusterId, ReviewStatus.SENT);
+      Report report = reportWithStatus(ReportStatus.COUNSELING);
+
+      UUID siblingAdjusterId = UUID.randomUUID();
+      ReportReview siblingReview = reviewWithId(UUID.randomUUID(), reportId, siblingAdjusterId, ReviewStatus.SENT);
+      ChatRoom closedSiblingRoom =
+          ChatRoomFixture.withId(UUID.randomUUID(), userId, siblingAdjusterId, reportId, UUID.randomUUID(),
+              ChatRoomStatus.CLOSED);
+
+      given(chatRoomRepository.findById(roomId)).willReturn(Optional.of(room));
+      given(reportReviewRepository.findById(reviewId)).willReturn(Optional.of(myReview));
+      given(reportRepository.findById(reportId)).willReturn(Optional.of(report));
+      given(reportReviewRepository.findByReportId(reportId)).willReturn(List.of(myReview, siblingReview));
+      given(chatRoomRepository.findByReportId(reportId)).willReturn(List.of(room, closedSiblingRoom));
+      stubMessageSave();
+
+      service.accept(userId, roomId);
+
+      assertThat(closedSiblingRoom.getStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+      // 내 방(수락 안내)만 브로드캐스트 — 이미 CLOSED인 형제 방엔 종료 안내를 다시 안 붙인다.
+      verify(chatEventPublisher, times(1)).publishAfterCommit(any());
+    }
+
+    @Test
     @DisplayName("방 소유자(user)가 아니면 CHAT_NOT_ROOM_OWNER(403)")
     void accept_notOwner_throwsForbidden() {
       ChatRoom room = pipelineRoom(ChatRoomStatus.ACTIVE);
@@ -238,7 +265,8 @@ class ChatConsultationCommandServiceTest {
 
       given(chatRoomRepository.findById(roomId)).willReturn(Optional.of(room));
       given(reportReviewRepository.findById(reviewId)).willReturn(Optional.of(myReview));
-      given(reportRepository.findById(reportId)).willReturn(Optional.of(report));
+      given(reportRepository.findByIdForUpdate(reportId)).willReturn(Optional.of(report));
+      given(reportReviewRepository.findByReportId(reportId)).willReturn(List.of(myReview));
       stubMessageSave();
 
       ConsultationDecisionResponse response = service.reject(userId, roomId);
@@ -251,10 +279,69 @@ class ChatConsultationCommandServiceTest {
       assertThat(response.reviewStatus()).isEqualTo(ReviewStatus.REJECTED);
       assertThat(response.reportStatus()).isEqualTo(ReportStatus.AWAITING_ADOPTION);
 
-      // 거절은 형제 제안·형제 방을 건드리지 않는다(설계서 §0-2) — 조회조차 하지 않아야 한다.
-      verify(reportReviewRepository, never()).findByReportId(any());
+      // 거절은 형제 제안·형제 방의 상태를 바꾸지 않는다(설계서 §0-2). 형제 제안 조회는 "리포트를 되돌려도
+      // 되는가"를 판정하기 위한 읽기일 뿐이고, 형제 방은 조회조차 하지 않는다.
       verify(chatRoomRepository, never()).findByReportId(any());
       verify(chatEventPublisher, times(1)).publishAfterCommit(any());
+    }
+
+    /**
+     * 같은 리포트에 상담이 2건 이상 동시에 진행 중일 때, 하나를 거절했다고 리포트를 채택 대기로 되돌리면
+     * 살아있는 상담이 채택 대기 풀로 새어 나가 {@code ReportNotSelectionSweeper}가 NOT_SELECTED로 잘못
+     * 전이시킬 수 있다. 형제가 아직 COUNSELING이면 리포트는 COUNSELING을 유지해야 한다.
+     */
+    @Test
+    @DisplayName("형제 제안이 아직 COUNSELING이면 리포트를 되돌리지 않는다 — 내 제안·내 방만 정리한다")
+    void reject_keepsReportCounseling_whenSiblingStillCounseling() {
+      ChatRoom room = pipelineRoom(ChatRoomStatus.ACTIVE);
+      ReportReview myReview = reviewWithId(reviewId, reportId, adjusterId, ReviewStatus.COUNSELING);
+      Report report = reportWithStatus(ReportStatus.COUNSELING);
+      ReportReview sibling =
+          reviewWithId(UUID.randomUUID(), reportId, UUID.randomUUID(), ReviewStatus.COUNSELING);
+
+      given(chatRoomRepository.findById(roomId)).willReturn(Optional.of(room));
+      given(reportReviewRepository.findById(reviewId)).willReturn(Optional.of(myReview));
+      given(reportRepository.findByIdForUpdate(reportId)).willReturn(Optional.of(report));
+      given(reportReviewRepository.findByReportId(reportId)).willReturn(List.of(myReview, sibling));
+      stubMessageSave();
+
+      ConsultationDecisionResponse response = service.reject(userId, roomId);
+
+      assertThat(myReview.getStatus()).isEqualTo(ReviewStatus.REJECTED);
+      assertThat(sibling.getStatus()).isEqualTo(ReviewStatus.COUNSELING);
+      assertThat(report.getStatus()).isEqualTo(ReportStatus.COUNSELING);
+      assertThat(room.getStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+
+      assertThat(response.reportStatus()).isEqualTo(ReportStatus.COUNSELING);
+      assertThat(response.reviewStatus()).isEqualTo(ReviewStatus.REJECTED);
+      assertThat(response.chatRoomStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+      // 형제 방은 열린 채로 둔다 — 조회조차 하지 않는다
+      verify(chatRoomRepository, never()).findByReportId(any());
+    }
+
+    /** 형제 판정 기준은 "형제가 있는가"가 아니라 "형제가 COUNSELING인가"다. */
+    @Test
+    @DisplayName("형제 제안이 SENT·ACCEPTED·REJECTED뿐이면 진행 중 상담이 없으므로 리포트를 채택 대기로 되돌린다")
+    void reject_reopensReport_whenNoSiblingIsCounseling() {
+      ChatRoom room = pipelineRoom(ChatRoomStatus.ACTIVE);
+      ReportReview myReview = reviewWithId(reviewId, reportId, adjusterId, ReviewStatus.COUNSELING);
+      Report report = reportWithStatus(ReportStatus.COUNSELING);
+
+      given(chatRoomRepository.findById(roomId)).willReturn(Optional.of(room));
+      given(reportReviewRepository.findById(reviewId)).willReturn(Optional.of(myReview));
+      given(reportRepository.findByIdForUpdate(reportId)).willReturn(Optional.of(report));
+      given(reportReviewRepository.findByReportId(reportId)).willReturn(List.of(
+          myReview,
+          reviewWithId(UUID.randomUUID(), reportId, UUID.randomUUID(), ReviewStatus.SENT),
+          reviewWithId(UUID.randomUUID(), reportId, UUID.randomUUID(), ReviewStatus.ACCEPTED),
+          reviewWithId(UUID.randomUUID(), reportId, UUID.randomUUID(), ReviewStatus.REJECTED)));
+      stubMessageSave();
+
+      ConsultationDecisionResponse response = service.reject(userId, roomId);
+
+      assertThat(report.getStatus()).isEqualTo(ReportStatus.AWAITING_ADOPTION);
+      assertThat(response.reportStatus()).isEqualTo(ReportStatus.AWAITING_ADOPTION);
+      assertThat(room.getStatus()).isEqualTo(ChatRoomStatus.CLOSED);
     }
 
     @Test
@@ -287,32 +374,40 @@ class ChatConsultationCommandServiceTest {
 
       given(chatRoomRepository.findById(roomId)).willReturn(Optional.of(room));
       given(reportReviewRepository.findById(reviewId)).willReturn(Optional.of(myReview));
-      given(reportRepository.findById(reportId)).willReturn(Optional.of(reportWithStatus(ReportStatus.CLOSED)));
+      given(reportRepository.findByIdForUpdate(reportId))
+          .willReturn(Optional.of(reportWithStatus(ReportStatus.CLOSED)));
 
       assertThatThrownBy(() -> service.reject(userId, roomId))
           .isInstanceOfSatisfying(BusinessException.class,
               ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.INVALID_STATE_TRANSITION));
     }
 
+    /**
+     * {@code reopenForAdoption()}은 COUNSELING이 아닌 리포트에서 무조건 409를 던진다(엔티티 계약). 제안 거절과
+     * 방 닫기는 리포트 상태와 무관하게 성립해야 하는 정리 작업이므로, 조건부인 것은 "리포트 되돌리기"뿐이다 —
+     * 리포트 경로 채택이 형제를 캐스케이드하지 않아 생기는 갭(design.md §9 #1)에서 여기로 들어와도 예외가 나면 안 된다.
+     */
     @Test
-    @DisplayName("report가 COUNSELING이 아니면 INVALID_STATE_TRANSITION(400)"
-        + " — DB 원자성(실패 시 미반영)은 통합 테스트에서 검증")
-    void reject_reportNotCounseling_throwsInvalidTransition() {
+    @DisplayName("report가 이미 COUNSELING이 아니면 리포트 전이만 건너뛰고 제안 거절·방 종료는 성립한다(409 없음)")
+    void reject_skipsReportTransition_whenReportNotCounseling() {
       ChatRoom room = pipelineRoom(ChatRoomStatus.ACTIVE);
-      ReportReview myReview = reviewWithId(reviewId, reportId, adjusterId, ReviewStatus.SENT);
-      Report report = reportWithStatus(ReportStatus.AWAITING_ADOPTION);
+      ReportReview myReview = reviewWithId(reviewId, reportId, adjusterId, ReviewStatus.COUNSELING);
+      Report report = reportWithStatus(ReportStatus.CLOSED);
 
       given(chatRoomRepository.findById(roomId)).willReturn(Optional.of(room));
       given(reportReviewRepository.findById(reviewId)).willReturn(Optional.of(myReview));
-      given(reportRepository.findById(reportId)).willReturn(Optional.of(report));
+      given(reportRepository.findByIdForUpdate(reportId)).willReturn(Optional.of(report));
+      given(reportReviewRepository.findByReportId(reportId)).willReturn(List.of(myReview));
+      stubMessageSave();
 
-      // 주의: 이 시나리오는 순수 Mockito 단위 테스트라 myReview.reject()가 report.reopenForAdoption()
-      // 예외 이전에 인메모리로 먼저 실행된다. 실제 DB 반영 여부(@Transactional 롤백)는 여기서 검증할 수
-      // 없으므로 상태 필드는 단언하지 않고, 예외 코드만 확인한다. 실제 원자성(미반영)은
-      // ChatConsultationCommandServiceIntegrationTest에서 실제 트랜잭션으로 검증한다.
-      assertThatThrownBy(() -> service.reject(userId, roomId))
-          .isInstanceOfSatisfying(BusinessException.class,
-              ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.INVALID_STATE_TRANSITION));
+      ConsultationDecisionResponse response = service.reject(userId, roomId);
+
+      assertThat(myReview.getStatus()).isEqualTo(ReviewStatus.REJECTED);
+      assertThat(report.getStatus()).isEqualTo(ReportStatus.CLOSED);
+      assertThat(room.getStatus()).isEqualTo(ChatRoomStatus.CLOSED);
+      assertThat(response.reportStatus()).isEqualTo(ReportStatus.CLOSED);
+      assertThat(response.reviewStatus()).isEqualTo(ReviewStatus.REJECTED);
+      assertThat(response.chatRoomStatus()).isEqualTo(ChatRoomStatus.CLOSED);
     }
   }
 }

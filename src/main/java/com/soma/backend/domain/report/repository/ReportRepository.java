@@ -4,12 +4,16 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+
+import jakarta.persistence.LockModeType;
 
 import com.soma.backend.domain.report.entity.AccidentType;
 import com.soma.backend.domain.report.entity.Report;
@@ -22,6 +26,20 @@ import com.soma.backend.domain.report.entity.ReportStatus;
 public interface ReportRepository extends JpaRepository<Report, UUID>, ReportRepositoryCustom {
 
   List<Report> findAllByIdIn(List<UUID> ids);
+
+  /**
+   * 상담 거절 시 "다른 COUNSELING 제안이 없으면 채택 대기로 복귀"를 원자적으로 판정하기 위한 잠금 조회.
+   *
+   * <p>같은 리포트의 형제 상담방을 동시에 거절하면 두 트랜잭션이 서로를 아직 COUNSELING으로 관찰해
+   * 둘 다 리포트 복귀를 건너뛰고, 리포트가 COUNSELING에 영구히 갇힌다(그 뒤로 COUNSELING을 벗어나는
+   * 경로가 없다 — {@code ReportNotSelectionSweeper}도 COUNSELING은 스윕하지 않는다). 이 잠금이 두 번째
+   * 거절 트랜잭션을 첫 번째가 커밋할 때까지 대기시켜 형제 상태를 정확히 관찰하게 한다.
+   *
+   * <p>거절 경로 전용이다 — 잠금이 필요 없는 조회는 {@code findById}를 그대로 쓴다.
+   */
+  @Lock(LockModeType.PESSIMISTIC_WRITE)
+  @Query("SELECT r FROM Report r WHERE r.id = :id")
+  Optional<Report> findByIdForUpdate(@Param("id") UUID id);
 
   /**
    * BLOCKED 알림 스윕 대상 — reports를 직접 스캔한다(ai.ocr_job_failures 저널에는 흔적이 없어 조인 불필요).
